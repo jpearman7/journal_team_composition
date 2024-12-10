@@ -1,0 +1,1026 @@
+---
+title: "apc_coding"
+date: "2024-10-1"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document:
+    toc: true
+editor_options:
+  chunk_output_type: console
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(ggthemes)
+library(gmodels)
+library(tidymodels)
+library(here)
+here::i_am("02_analysis.Rmd")
+here()
+
+```
+
+# 1) Load data
+
+```{r}
+# Read data in
+df <- read.csv("processed_data/aom_data_oct22_2024.csv")
+df_cr <- readRDS("processed_data/aom_cross_ref_oc1_2024.rds")
+
+
+```
+
+# 2) Create variables for analyses
+
+## 2.1) Create predictor variables of R1_team, R1_ratio, and Blau index
+
+```{r}
+
+# Select data with full uni classification
+df_r1r2i <- df 
+
+
+# binary R1 or no R1 variable (R1 in team or individual coded as 1)
+df_r1r2i <- df_r1r2i %>% 
+  mutate(R1_author = as.integer(uni_type == "R1")) %>% 
+  group_by(manuscript_id) %>% 
+  mutate(R1_team = as.integer(any(uni_type == "R1"))) 
+
+# ratio of R1 to R2; R1 to R2 and I
+
+r1_ratio_r1r2i <- df_r1r2i %>% 
+  group_by(manuscript_id) %>% 
+  summarise(R1_ratio = mean(R1_author))
+
+df_r1r2i <- left_join(df_r1r2i, r1_ratio_r1r2i)
+
+# blau index function
+
+get.blau.index <- function(x, type) {
+    x <- factor(x, levels = type);
+    t <- table(x);
+    if (length(t[t>0]) == 1) return(0) else return(1 - sum(prop.table(t)^2));
+}
+
+# Add blau index for R1, R2, International data
+
+blau_index_r1r2i <- df_r1r2i %>% group_by(manuscript_id) %>% 
+  summarise(blau_institution = get.blau.index(uni_type)) %>% 
+  ungroup()
+
+df_r1r2i_blau <- left_join(df_r1r2i, blau_index_r1r2i) %>% 
+  arrange(manuscript_id)
+
+```
+
+3/28/24 - Can also use these operationalizations for the country data -
+Hypotheses? R1 \> R2 in acceptance rate across these factors - Possible
+moderators? Country (US +), authorship order (first or last +)
+
+3/30/24 - Use the \_blau dataframes for individual-level analysis
+
+## 2.2) Create article-level dataframes
+
+```{r}
+## Only keep one observation per unique manuscript
+df_r1r2i_article <- df_r1r2i_blau[!duplicated(df_r1r2i_blau$manuscript_id),]
+
+## Select team-level variables
+df_r1r2i_article <- df_r1r2i_article %>% select(manuscript_id, Manuscript.Type, 
+                                                journal, Decision, cite, team_size, R1_team, R1_ratio, blau_institution)
+
+```
+
+#3) Tidymodels approach
+## Prepare and check data
+```{r}
+# Convert relevant string columns to factors
+article_df <- df_r1r2i_article %>% 
+  mutate(Decision = as.factor(Decision)) %>% 
+  ungroup() %>% 
+  select(-c(manuscript_id, Manuscript.Type, cite))
+
+author_df <- df_r1r2i_blau %>% 
+  mutate(Decision = as.factor(Decision))
+
+# Examine data
+glimpse(article_df)
+
+# Identify proportion of outcome
+article_df %>% 
+  count(Decision) %>% 
+  mutate(prop = n/sum(n)) # 86.7% rejected, 13.4% accepted across journals.
+
+# Examine proportions within journals
+article_df %>% 
+  group_by(journal) %>% 
+  count(Decision) %>% 
+  mutate(prop = n/sum(n))
+
+amj_df <- article_df %>% 
+  filter(journal == "AMJ")
+
+amr_df <- article_df %>% 
+  filter(journal == "AMR")
+
+amp_df <- article_df %>% 
+  filter(journal == "AMP")
+
+amd_df <- article_df %>% 
+  filter(journal == "AMD")
+
+annals_df <- article_df %>% 
+  filter(journal == "ANNALS")
+
+amle_df <- article_df %>% 
+  filter(journal == "AMLE")
+```
+
+## 3.1) Analyze across all journals
+### Data splitting and resampling
+```{r}
+set.seed(123)
+
+# Split data using Decision outcome for strata
+article_split <- initial_split(article_df,
+                               strata = Decision)
+
+# Create training and test splits
+article_train <- training(article_split)
+article_test <- testing(article_split)
+
+nrow(article_train)
+nrow(article_train)/nrow(article_df) 
+
+# Calculate proportions by outcome class
+article_train %>% 
+  count(Decision) %>% 
+  mutate(prop = n/sum(n))
+
+article_test %>% 
+  count(Decision) %>% 
+  mutate(prop = n/sum(n))
+
+# Create validation set
+val_set <- validation_split(article_train,
+                            strata = Decision, 
+                            prop = 0.80)
+
+```
+
+### Create Penalized Logistic Regression model
+```{r}
+# Specify statistical model
+lr_mod <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet")
+
+# Create recipe to standardize predictors
+lr_recipe <- 
+  recipe(Decision ~ ., data = article_train) %>% 
+  step_zv(all_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(c(team_size, R1_team, R1_ratio, blau_institution))
+
+# Workflow integrating stat model and recipe
+lr_workflow <- 
+  workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(lr_recipe)
+
+# Grid of penalty values
+lr_reg_grid <- tibble(penalty = 10^seq(-4, -1, length.out = 30))
+lr_reg_grid %>% top_n(-5) # lowest values
+lr_reg_grid %>% top_n(5) # highest values
+
+
+```
+
+### Train and tune model
+```{r}
+# train 30 penalized LR models
+lr_res <- 
+  lr_workflow %>% 
+  tune_grid(val_set,
+            grid = lr_reg_grid,
+            control = control_grid(save_pred = T),
+            metrics = metric_set(roc_auc))
+
+lr_plot <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = penalty, y = mean)) + 
+  geom_point() + 
+  geom_line() + 
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = scales::label_number())
+lr_plot
+# Indicates that generally lower penalty values have higher AUC values, better performance
+
+# Show top models based on AUC and associated penalty values
+top_models <- 
+  lr_res %>% 
+  show_best(metric = "roc_auc", n = 15) %>% 
+  arrange(penalty)
+top_models
+
+# Select best LR model
+lr_best <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  arrange(penalty) %>% 
+  slice(12)
+
+lr_best
+
+lr_auc <- lr_res %>% 
+  collect_predictions(parameters = lr_best) %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  mutate(model = "Logistic Regression")
+
+autoplot(lr_auc)
+
+```
+
+### Tree-based model approach
+### Build model
+```{r}
+
+cores <- parallel::detectCores()
+cores
+
+# Random forests
+rf_mod <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores) %>% 
+  set_mode("classification")
+
+rf_recipe <- 
+  recipe(Decision ~ ., data = article_train)
+
+rf_workflow <- 
+  workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_recipe(rf_recipe)
+```
+
+### Train and tune model
+```{r}
+rf_mod
+
+extract_parameter_set_dials(rf_mod)
+
+set.seed(123)
+rf_res <- 
+  rf_workflow %>% 
+  tune_grid(val_set,
+            grid = 25,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+```
+
+### Evaluate model
+```{r}
+rf_res %>% 
+  show_best(metric = "roc_auc")
+
+autoplot(rf_res)
+
+rf_best <- 
+  rf_res %>% 
+  select_best(metric = "roc_auc")
+rf_best
+
+rf_res %>% 
+  collect_predictions()
+
+rf_auc <- 
+  rf_res %>% 
+  collect_predictions(parameters = rf_best) %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  mutate(model = "Random Forest")
+
+bind_rows(rf_auc, lr_auc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)
+```
+
+### Evaluate last fit
+### Final model 
+```{r}
+last_rf_mod <- 
+  rand_forest(mtry = 8, min_n = 7, trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores, importance = "impurity") %>% 
+  set_mode("classification")
+
+# the last workflow
+last_rf_workflow <- 
+  rf_workflow %>% 
+  update_model(last_rf_mod)
+
+# the last fit
+set.seed(123)
+last_rf_fit <- 
+  last_rf_workflow %>% 
+  last_fit(article_split)
+
+last_rf_fit %>% collect_metrics
+```
+
+### Examine importance of specific variables
+```{r}
+library(vip)
+last_rf_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip(num_features = 5)
+
+last_rf_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  autoplot()
+
+```
+
+
+## 3.2) AMJ results
+### Data splitting and resampling
+```{r}
+set.seed(123)
+
+# Split data using Decision outcome for strata
+article_split <- initial_split(amj_df,
+                               strata = Decision)
+
+# Create training and test splits
+article_train <- training(article_split)
+article_test <- testing(article_split)
+
+nrow(article_train)
+nrow(article_train)/nrow(amj_df) 
+
+# Calculate proportions by outcome class
+article_train %>% 
+  count(Decision) %>% 
+  mutate(prop = n/sum(n))
+
+article_test %>% 
+  count(Decision) %>% 
+  mutate(prop = n/sum(n))
+
+# Create validation set
+val_set <- validation_split(article_train,
+                            strata = Decision, 
+                            prop = 0.80)
+
+```
+
+### Create Penalized Logistic Regression model
+```{r}
+# Specify statistical model
+lr_mod <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet")
+
+# Create recipe to standardize predictors
+lr_recipe <- 
+  recipe(Decision ~ ., data = article_train) %>% 
+  step_zv(all_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(c(team_size, R1_team, R1_ratio, blau_institution))
+
+# Workflow integrating stat model and recipe
+lr_workflow <- 
+  workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(lr_recipe)
+
+# Grid of penalty values
+lr_reg_grid <- tibble(penalty = 10^seq(-4, -1, length.out = 30))
+lr_reg_grid %>% top_n(-5) # lowest values
+lr_reg_grid %>% top_n(5) # highest values
+
+
+```
+
+### Train and tune model
+```{r}
+# train 30 penalized LR models
+lr_res <- 
+  lr_workflow %>% 
+  tune_grid(val_set,
+            grid = lr_reg_grid,
+            control = control_grid(save_pred = T),
+            metrics = metric_set(roc_auc))
+
+lr_plot <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = penalty, y = mean)) + 
+  geom_point() + 
+  geom_line() + 
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = scales::label_number())
+lr_plot
+# Indicates that generally lower penalty values have higher AUC values, better performance
+
+# Show top models based on AUC and associated penalty values
+top_models <- 
+  lr_res %>% 
+  show_best(metric = "roc_auc", n = 15) %>% 
+  arrange(penalty)
+top_models
+
+# Select best LR model
+lr_best <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  arrange(penalty) %>% 
+  slice(12)
+
+lr_best
+
+lr_auc <- lr_res %>% 
+  collect_predictions(parameters = lr_best) %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  mutate(model = "Logistic Regression")
+
+autoplot(lr_auc)
+
+```
+
+### Tree-based model approach
+### Build model
+```{r}
+
+cores <- parallel::detectCores()
+cores
+
+# Random forests
+rf_mod <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores) %>% 
+  set_mode("classification")
+
+rf_recipe <- 
+  recipe(Decision ~ ., data = article_train)
+
+rf_workflow <- 
+  workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_recipe(rf_recipe)
+```
+
+### Train and tune model
+```{r}
+rf_mod
+
+extract_parameter_set_dials(rf_mod)
+
+set.seed(123)
+rf_res <- 
+  rf_workflow %>% 
+  tune_grid(val_set,
+            grid = 25,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+```
+
+### Evaluate model
+```{r}
+rf_res %>% 
+  show_best(metric = "roc_auc")
+
+autoplot(rf_res)
+
+rf_best <- 
+  rf_res %>% 
+  select_best(metric = "roc_auc")
+rf_best
+
+rf_res %>% 
+  collect_predictions()
+
+rf_auc <- 
+  rf_res %>% 
+  collect_predictions(parameters = rf_best) %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  mutate(model = "Random Forest")
+
+bind_rows(rf_auc, lr_auc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)
+```
+
+### Evaluate last fit
+### Final model 
+```{r}
+last_rf_mod <- 
+  rand_forest(mtry = 8, min_n = 7, trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores, importance = "impurity") %>% 
+  set_mode("classification")
+
+# the last workflow
+last_rf_workflow <- 
+  rf_workflow %>% 
+  update_model(last_rf_mod)
+
+# the last fit
+set.seed(123)
+last_rf_fit <- 
+  last_rf_workflow %>% 
+  last_fit(article_split)
+
+last_rf_fit %>% collect_metrics
+```
+
+### Examine importance of specific variables
+```{r}
+library(vip)
+last_rf_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip(num_features = 5)
+
+last_rf_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  autoplot()
+
+```
+
+## 3.3) AMR results
+### Data splitting and resampling
+```{r}
+set.seed(123)
+
+# Split data using Decision outcome for strata
+article_split <- initial_split(amr_df,
+                               strata = Decision)
+
+# Create training and test splits
+article_train <- training(article_split)
+article_test <- testing(article_split)
+
+nrow(article_train)
+nrow(article_train)/nrow(amr_df) 
+
+# Calculate proportions by outcome class
+article_train %>% 
+  count(Decision) %>% 
+  mutate(prop = n/sum(n))
+
+article_test %>% 
+  count(Decision) %>% 
+  mutate(prop = n/sum(n))
+
+# Create validation set
+val_set <- validation_split(article_train,
+                            strata = Decision, 
+                            prop = 0.80)
+
+```
+
+### Create Penalized Logistic Regression model
+```{r}
+# Specify statistical model
+lr_mod <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet")
+
+# Create recipe to standardize predictors
+lr_recipe <- 
+  recipe(Decision ~ ., data = article_train) %>% 
+  step_zv(all_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(c(team_size, R1_team, R1_ratio, blau_institution))
+
+# Workflow integrating stat model and recipe
+lr_workflow <- 
+  workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(lr_recipe)
+
+# Grid of penalty values
+lr_reg_grid <- tibble(penalty = 10^seq(-4, -1, length.out = 30))
+lr_reg_grid %>% top_n(-5) # lowest values
+lr_reg_grid %>% top_n(5) # highest values
+
+
+```
+
+### Train and tune model
+```{r}
+# train 30 penalized LR models
+lr_res <- 
+  lr_workflow %>% 
+  tune_grid(val_set,
+            grid = lr_reg_grid,
+            control = control_grid(save_pred = T),
+            metrics = metric_set(roc_auc))
+
+lr_plot <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = penalty, y = mean)) + 
+  geom_point() + 
+  geom_line() + 
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = scales::label_number())
+lr_plot
+# Indicates that generally lower penalty values have higher AUC values, better performance
+
+# Show top models based on AUC and associated penalty values
+top_models <- 
+  lr_res %>% 
+  show_best(metric = "roc_auc", n = 15) %>% 
+  arrange(penalty)
+top_models
+
+# Select best LR model
+lr_best <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  arrange(penalty) %>% 
+  slice(12)
+
+lr_best
+
+lr_auc <- lr_res %>% 
+  collect_predictions(parameters = lr_best) %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  mutate(model = "Logistic Regression")
+
+autoplot(lr_auc)
+
+```
+
+### Tree-based model approach
+### Build model
+```{r}
+
+cores <- parallel::detectCores()
+cores
+
+# Random forests
+rf_mod <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores) %>% 
+  set_mode("classification")
+
+rf_recipe <- 
+  recipe(Decision ~ ., data = article_train)
+
+rf_workflow <- 
+  workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_recipe(rf_recipe)
+```
+
+### Train and tune model
+```{r}
+rf_mod
+
+extract_parameter_set_dials(rf_mod)
+
+set.seed(123)
+rf_res <- 
+  rf_workflow %>% 
+  tune_grid(val_set,
+            grid = 25,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+```
+
+### Evaluate model
+```{r}
+rf_res %>% 
+  show_best(metric = "roc_auc")
+
+autoplot(rf_res)
+
+rf_best <- 
+  rf_res %>% 
+  select_best(metric = "roc_auc")
+rf_best
+
+rf_res %>% 
+  collect_predictions()
+
+rf_auc <- 
+  rf_res %>% 
+  collect_predictions(parameters = rf_best) %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  mutate(model = "Random Forest")
+
+bind_rows(rf_auc, lr_auc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)
+```
+
+### Evaluate last fit
+### Final model 
+```{r}
+last_rf_mod <- 
+  rand_forest(mtry = 8, min_n = 7, trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores, importance = "impurity") %>% 
+  set_mode("classification")
+
+# the last workflow
+last_rf_workflow <- 
+  rf_workflow %>% 
+  update_model(last_rf_mod)
+
+# the last fit
+set.seed(123)
+last_rf_fit <- 
+  last_rf_workflow %>% 
+  last_fit(article_split)
+
+last_rf_fit %>% collect_metrics
+```
+
+### Examine importance of specific variables
+```{r}
+library(vip)
+last_rf_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip(num_features = 5)
+
+last_rf_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  autoplot()
+
+```
+
+## 3.4) results
+### Data splitting and resampling
+```{r}
+set.seed(123)
+
+# Split data using Decision outcome for strata
+article_split <- initial_split(amle_df,
+                               strata = Decision)
+
+# Create training and test splits
+article_train <- training(article_split)
+article_test <- testing(article_split)
+
+nrow(article_train)
+nrow(article_train)/nrow(amle_df) 
+
+# Calculate proportions by outcome class
+article_train %>% 
+  count(Decision) %>% 
+  mutate(prop = n/sum(n))
+
+article_test %>% 
+  count(Decision) %>% 
+  mutate(prop = n/sum(n))
+
+# Create validation set
+val_set <- validation_split(article_train,
+                            strata = Decision, 
+                            prop = 0.80)
+
+```
+
+### Create Penalized Logistic Regression model
+```{r}
+# Specify statistical model
+lr_mod <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet")
+
+# Create recipe to standardize predictors
+lr_recipe <- 
+  recipe(Decision ~ ., data = article_train) %>% 
+  step_zv(all_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(c(team_size, R1_team, R1_ratio, blau_institution))
+
+# Workflow integrating stat model and recipe
+lr_workflow <- 
+  workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(lr_recipe)
+
+# Grid of penalty values
+lr_reg_grid <- tibble(penalty = 10^seq(-4, -1, length.out = 30))
+lr_reg_grid %>% top_n(-5) # lowest values
+lr_reg_grid %>% top_n(5) # highest values
+
+
+```
+
+### Train and tune model
+```{r}
+# train 30 penalized LR models
+lr_res <- 
+  lr_workflow %>% 
+  tune_grid(val_set,
+            grid = lr_reg_grid,
+            control = control_grid(save_pred = T),
+            metrics = metric_set(roc_auc))
+
+lr_plot <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = penalty, y = mean)) + 
+  geom_point() + 
+  geom_line() + 
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = scales::label_number())
+lr_plot
+# Indicates that generally lower penalty values have higher AUC values, better performance
+
+# Show top models based on AUC and associated penalty values
+top_models <- 
+  lr_res %>% 
+  show_best(metric = "roc_auc", n = 15) %>% 
+  arrange(penalty)
+top_models
+
+# Select best LR model
+lr_best <- 
+  lr_res %>% 
+  collect_metrics() %>% 
+  arrange(penalty) %>% 
+  slice(12)
+
+lr_best
+
+lr_auc <- lr_res %>% 
+  collect_predictions(parameters = lr_best) %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  mutate(model = "Logistic Regression")
+
+autoplot(lr_auc)
+
+```
+
+### Tree-based model approach
+### Build model
+```{r}
+
+cores <- parallel::detectCores()
+cores
+
+# Random forests
+rf_mod <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores) %>% 
+  set_mode("classification")
+
+rf_recipe <- 
+  recipe(Decision ~ ., data = article_train)
+
+rf_workflow <- 
+  workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_recipe(rf_recipe)
+```
+
+### Train and tune model
+```{r}
+rf_mod
+
+extract_parameter_set_dials(rf_mod)
+
+set.seed(123)
+rf_res <- 
+  rf_workflow %>% 
+  tune_grid(val_set,
+            grid = 25,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+```
+
+### Evaluate model
+```{r}
+rf_res %>% 
+  show_best(metric = "roc_auc")
+
+autoplot(rf_res)
+
+rf_best <- 
+  rf_res %>% 
+  select_best(metric = "roc_auc")
+rf_best
+
+rf_res %>% 
+  collect_predictions()
+
+rf_auc <- 
+  rf_res %>% 
+  collect_predictions(parameters = rf_best) %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  mutate(model = "Random Forest")
+
+bind_rows(rf_auc, lr_auc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)
+```
+
+### Evaluate last fit
+### Final model 
+```{r}
+last_rf_mod <- 
+  rand_forest(mtry = 8, min_n = 7, trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores, importance = "impurity") %>% 
+  set_mode("classification")
+
+# the last workflow
+last_rf_workflow <- 
+  rf_workflow %>% 
+  update_model(last_rf_mod)
+
+# the last fit
+set.seed(123)
+last_rf_fit <- 
+  last_rf_workflow %>% 
+  last_fit(article_split)
+
+last_rf_fit %>% collect_metrics
+```
+
+### Examine importance of specific variables
+```{r}
+library(vip)
+last_rf_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip(num_features = 5)
+
+last_rf_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(Decision, .pred_Accepted) %>% 
+  autoplot()
+
+```
+
+# 4) Optimal cutpoints approach
+## 4.1) Bootstrapped version of model using journals as subgroups
+
+```{r}
+
+# Start parallel clusters
+library(doParallel)
+cores <- parallel::detectCores()
+cores
+
+c1 <- makeCluster(8)
+registerDoParallel(c1)
+
+# Register parallel backend for reproducibility
+library(doRNG)
+registerDoRNG(12)
+
+# Use cutpointr package to identify optimal cutpoints based on ROC curves
+library(cutpointr)
+
+# Logistic regression model 
+aom_model <- glm(Decision ~ R1_team + R1_ratio + blau_institution, article_df, family = binomial)
+
+# Add predicted probabilities
+article_df$predicted_glm <- predict(aom_model, type = "response")
+
+result_b <- cutpointr(data = article_df, 
+                    x = predicted_glm,
+                    class = Decision,
+                    subgroup = journal,
+                    boot_runs = 1000,
+                    allowParallel = T)
+
+# Stop parallel clusters
+stopCluster(c1)
+
+# Examine bootstrapped results
+result_b$boot
+
+summary(result_b)
+
+result_b %>% t()
+
+plot(result_b)
+# plot_roc(result_b)
+# plot_metric(result_b)
+
+```
+
+
